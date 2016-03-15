@@ -1,0 +1,181 @@
+#!/usr/bin/ruby -w
+
+# oarsub -t deploy -l {"type='kavlan'"}/vlan=1,walltime=5 'sleep 1d'
+
+require 'resolv'
+require 'pp'
+require 'open-uri'
+require 'json'
+require 'openssl'
+require 'peach'
+
+Thread.abort_on_exception = true
+
+# hack :(
+OpenSSL::SSL::VERIFY_PEER = OpenSSL::SSL::VERIFY_NONE
+
+class Node
+  attr_reader :site, :cluster, :id, :vlan, :if
+
+  def initialize(name)
+    r = r
+    uid, @site, r, r = name.split('.')
+    @cluster, @id, rest = uid.split('-', 3)
+    @id = @id.to_i
+    @vlan = 'DEFAULT'
+    @if = 'eth0'
+    if rest and rest =~ /^eth/
+      @if, rest = rest.split('-', 2)
+    end
+    if rest and rest =~ /^kavlan/
+      r, @vlan = rest.split('-', 2)
+      @vlan = @vlan.to_i
+    end
+  end
+
+  def set_vlan(vlan)
+    if vlan == 'DEFAULT'
+      @vlan = vlan
+    else
+      @vlan = vlan.to_i
+    end
+    return self
+  end
+
+  def set_if(iface)
+    @if = iface ; self
+  end
+
+  def to_s
+    s = "#{@cluster}-#{@id}"
+    s += "-#{@if}" if @if != 'eth0'
+    s += "-kavlan-#{@vlan}" if @vlan != 'DEFAULT'
+    s += ".#{@site}.grid5000.fr"
+    return s
+  end
+
+  def to_h
+    return { :site => @site, :cluster => @cluster, :id => @id, :vlan => @vlan, :if => @if }
+  end
+
+  def ip_config
+    if @cluster == 'grisou' and @if != 'eth0'
+      ip, gw = nil
+      if @vlan != 'DEFAULT'
+        # special case: grisou doesn't have DHCP entries for ifaces > eth0. So we steal the IP configuration from the first interface
+        if (4..6).include?(@vlan)
+          ip = "10.16.#{(@vlan - 4)*64+12}.#{@id}/18"
+          gw = "10.16.#{(@vlan - 4)*64+63}.254"
+        elsif (7..9).include?(@vlan)
+          ip = "10.17.#{(@vlan - 4)*64+12}.#{@id}/18"
+          gw = "10.17.#{(@vlan - 4)*64+63}.254"
+        else
+          raise
+        end
+      else
+        if @if == 'eth1'
+          ip = "172.16.72.#{60+@id}/20"
+          gw = "172.16.79.254"
+        elsif @if == 'eth2'
+          ip = "172.16.72.#{120+@id}/20"
+          gw = "172.16.79.254"
+        elsif @if == 'eth3'
+          ip = "172.16.72.#{180+@id}/20"
+          gw = "172.16.79.254"
+        else
+          raise
+        end
+      end
+      shortip = ip.split('/', 2)[0]
+      return ["ip addr change dev #{@if} #{ip} ; ip route change default via #{gw} ; ip link set dev #{@if} up ; arping -c 60 -P -U -I #{@if} #{ip} >/tmp/arping.#{@if}.#{ip}.log 2>&1", shortip ]
+    else
+      ip = Resolv.getaddress to_s
+      return [ "dhclient -cf /tmp/dhclient.conf -1 #{@if} > /tmp/dhclient.#{@if}.log 2>&1 ; arping -c 60 -P -U -I #{@if} #{ip} >/tmp/arping.#{@if}.#{ip}.log 2>&1", to_s]
+    end
+  end
+
+  def dup
+    return Node::new(to_s)
+  end
+
+  $cache ||= {}
+  $mutex = Mutex::new
+  def additional_interfaces
+    $mutex.synchronize do 
+      unless $cache["#{@site}-#{@cluster}"]
+        $cache["#{@site}-#{@cluster}"] = JSON::parse(open("https://api.grid5000.fr/3.0/sites/#{@site}/clusters/#{@cluster}/nodes").read)['items']
+      end
+    end
+    n = $cache["#{@site}-#{@cluster}"].select { |e| e['uid'] == "#{@cluster}-#{@id}" }.first
+    return n['network_adapters'].select { |e| e['mountable'] and not e['mounted'] and e['interface'] == 'Ethernet' }.map { |e| e['device'] }
+  end
+
+  def init
+    puts "#{Time::now} Initializing #{to_s}"
+    system("kavlan -s -i DEFAULT -m #{to_s}") or raise # make sure all interfaces are in the DEFAULT VLAN
+    system "ssh root@#{to_s} 'pkill -9 dhclient ; apt-get -y install screen arping ; sysctl -w net.ipv4.conf.all.arp_ignore=1'" or raise
+    system "echo \"timeout 60; reboot 0; backoff-cutoff 3; initial-interval 1; initial-delay 0;\" | ssh root@#{to_s} \"cat > /tmp/dhclient.conf\"" or raise
+    additional_interfaces.each do |iface|
+      nnode = dup.set_if(iface)
+      puts "#{Time::now} Initializing #{nnode.to_s}"
+      system("kavlan -s -i DEFAULT -m #{nnode.to_s}") or raise # make sure all interfaces are in the DEFAULT VLAN
+      ipcfg, host = nnode.ip_config
+      system "ssh root@#{to_s} 'pkill -9 -f \"^dhclient.*#{iface}$\" ; pkill -9 arping ; nohup sh -c \"ifdown #{iface}; ifconfig #{iface} 0.0.0.0 down; #{ipcfg}\" </dev/null >/dev/null 2>&1 &'"
+      r = check_ping(host)
+      raise "Failed to ping #{nnode.to_s} (#{host})" if not r[0]
+    end
+  end
+
+  def check_ping(host, timeout = 60)
+    t0 = Time::now
+    while Time::now - t0 < timeout
+      system("ping -c 1 -W 1 #{host} >/dev/null 2>&1")
+      if $?.exitstatus == 0
+        return [true, Time::now - t0 ]
+      end
+    end
+    return [false, Time::now - t0 ]
+  end
+
+  def change_vlan(to_vlan, delay=5)
+    newnode = dup.set_vlan(to_vlan)
+    ipcfg, host = newnode.ip_config
+    if @if == 'eth0'
+      ssh_node = to_s
+    else
+      ssh_node = dup.set_if('eth0').to_s
+    end
+    system "ssh root@#{ssh_node} 'pkill -9 -f \"^dhclient.*#{self.if}$\" ; pkill -9 arping ; nohup sh -c \"sleep #{delay}; ifdown #{@if}; ifconfig #{@if} 0.0.0.0 down; #{ipcfg}\" </dev/null >/dev/null 2>&1 &'"
+    system("kavlan -s -i #{to_vlan} -m #{dup.set_vlan('DEFAULT').to_s}") or raise
+    set_vlan(to_vlan)
+    r = check_ping(host)
+    raise "Failed to ping #{to_s} after switch to VLAN #{to_vlan} (#{host})" if not r[0]
+    puts "#{Time::now} OK #{to_s} #{r[1].to_i}s"
+  end
+
+  def check_vlan(other_vlan)
+    change_vlan(other_vlan)
+    change_vlan('DEFAULT')
+  end
+end
+
+nodes = %w{grisou-3.nancy.grid5000.fr
+grisou-20.nancy.grid5000.fr}
+
+vlan = 4
+
+TEST_ALL_INTERFACES=false
+
+nodes.peach(1000) do |node|
+  n0 = Node::new(node)
+  n0.init
+  while true do
+    n0.check_vlan(vlan)
+    if TEST_ALL_INTERFACES
+      n0.additional_interfaces.each do |iface|
+        n1 = n0.dup.set_if(iface)
+        n1.check_vlan(vlan)
+      end
+    end
+  end
+end
