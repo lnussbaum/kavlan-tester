@@ -1,18 +1,18 @@
 #!/usr/bin/ruby -w
 
-# oarsub -t deploy -l {"type='kavlan'"}/vlan=1,walltime=5 'sleep 1d'
-
 require 'resolv'
 require 'pp'
 require 'open-uri'
 require 'json'
 require 'openssl'
 require 'peach'
-
 Thread.abort_on_exception = true
+OpenSSL::SSL::VERIFY_PEER = OpenSSL::SSL::VERIFY_NONE # hack :(
 
-# hack :(
-OpenSSL::SSL::VERIFY_PEER = OpenSSL::SSL::VERIFY_NONE
+vlan = 4
+NODESLIST='/home/lnussbaum/nodes'
+TEST_ALL_INTERFACES=true
+TEST_CYCLES=5
 
 class Node
   attr_reader :site, :cluster, :id, :vlan, :if
@@ -61,13 +61,15 @@ class Node
   def ip_config
     if @cluster == 'grisou' and @if != 'eth0'
       ip, gw = nil
+      nif = @if[3].to_i
       if @vlan != 'DEFAULT'
-        # special case: grisou doesn't have DHCP entries for ifaces > eth0. So we steal the IP configuration from the first interface
+        # special case: grisou doesn't have DHCP entries for ifaces > eth0. So we 
+        # just allocate IPs in 10.16.[60-63].*
         if (4..6).include?(@vlan)
-          ip = "10.16.#{(@vlan - 4)*64+12}.#{@id}/18"
+          ip = "10.16.#{(@vlan - 4)*64+60+nif}.#{@id}/18"
           gw = "10.16.#{(@vlan - 4)*64+63}.254"
         elsif (7..9).include?(@vlan)
-          ip = "10.17.#{(@vlan - 4)*64+12}.#{@id}/18"
+          ip = "10.17.#{(@vlan - 4)*64+60+nif}.#{@id}/18"
           gw = "10.17.#{(@vlan - 4)*64+63}.254"
         else
           raise
@@ -115,14 +117,16 @@ class Node
     system("kavlan -s -i DEFAULT -m #{to_s}") or raise # make sure all interfaces are in the DEFAULT VLAN
     system "ssh root@#{to_s} 'pkill -9 dhclient ; apt-get -y install screen arping ; sysctl -w net.ipv4.conf.all.arp_ignore=1'" or raise
     system "echo \"timeout 60; reboot 0; backoff-cutoff 3; initial-interval 1; initial-delay 0;\" | ssh root@#{to_s} \"cat > /tmp/dhclient.conf\"" or raise
-    additional_interfaces.each do |iface|
-      nnode = dup.set_if(iface)
-      puts "#{Time::now} Initializing #{nnode.to_s}"
-      system("kavlan -s -i DEFAULT -m #{nnode.to_s}") or raise # make sure all interfaces are in the DEFAULT VLAN
-      ipcfg, host = nnode.ip_config
-      system "ssh root@#{to_s} 'pkill -9 -f \"^dhclient.*#{iface}$\" ; pkill -9 arping ; nohup sh -c \"ifdown #{iface}; ifconfig #{iface} 0.0.0.0 down; #{ipcfg}\" </dev/null >/dev/null 2>&1 &'"
-      r = check_ping(host)
-      raise "Failed to ping #{nnode.to_s} (#{host})" if not r[0]
+    if TEST_ALL_INTERFACES
+      additional_interfaces.each do |iface|
+        nnode = dup.set_if(iface)
+        puts "#{Time::now} Initializing #{nnode.to_s}"
+        system("kavlan -s -i DEFAULT -m #{nnode.to_s}") or raise # make sure all interfaces are in the DEFAULT VLAN
+        ipcfg, host = nnode.ip_config
+        system "ssh root@#{to_s} 'pkill -9 -f \"^dhclient.*#{iface}$\" ; pkill -9 arping ; nohup sh -c \"ifdown #{iface}; ifconfig #{iface} 0.0.0.0 down; #{ipcfg}\" </dev/null >/dev/null 2>&1 &'"
+        r = check_ping(host)
+        raise "Failed to ping #{nnode.to_s} (#{host})" if not r[0]
+      end
     end
   end
 
@@ -143,7 +147,7 @@ class Node
     if @if == 'eth0'
       ssh_node = to_s
     else
-      ssh_node = dup.set_if('eth0').to_s
+      ssh_node = dup.set_vlan('DEFAULT').set_if('eth0').to_s
     end
     system "ssh root@#{ssh_node} 'pkill -9 -f \"^dhclient.*#{self.if}$\" ; pkill -9 arping ; nohup sh -c \"sleep #{delay}; ifdown #{@if}; ifconfig #{@if} 0.0.0.0 down; #{ipcfg}\" </dev/null >/dev/null 2>&1 &'"
     system("kavlan -s -i #{to_vlan} -m #{dup.set_vlan('DEFAULT').to_s}") or raise
@@ -159,17 +163,11 @@ class Node
   end
 end
 
-nodes = %w{grisou-3.nancy.grid5000.fr
-grisou-20.nancy.grid5000.fr}
-
-vlan = 4
-
-TEST_ALL_INTERFACES=false
-
+nodes = IO::read(NODESLIST).split("\n").uniq.shuffle
 nodes.peach(1000) do |node|
   n0 = Node::new(node)
   n0.init
-  while true do
+  TEST_CYCLES.times do
     n0.check_vlan(vlan)
     if TEST_ALL_INTERFACES
       n0.additional_interfaces.each do |iface|
